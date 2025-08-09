@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Face Tracking • Blink Counter • Engagement</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root { --bg:#0e0f13; --panel:#171922; --accent:#5eead4; --text:#e5e7eb; --muted:#9ca3af; }
+  *{box-sizing:border-box} html,body{height:100%} body{
+    margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif;
+    background:linear-gradient(180deg, #0b0c10, #0e0f13);
+    color:var(--text);
+  }
+  header{padding:16px 22px; font-weight:700; letter-spacing:.2px}
+  .wrap{max-width:1100px; margin:0 auto; padding:16px; display:grid; gap:16px;}
+  .grid{display:grid; grid-template-columns: 1.2fr .8fr; gap:16px}
+  .card{background:var(--panel); border:1px solid #222533; border-radius:16px; padding:12px; box-shadow:0 10px 24px rgba(0,0,0,.25)}
+  .videoWrap{position:relative; border-radius:12px; overflow:hidden}
+  video, canvas{display:block; width:100%; height:auto}
+  .hud{
+    position:absolute; left:12px; bottom:12px; display:flex; gap:12px; flex-wrap:wrap;
+    background:rgba(12,14,18,.6); backdrop-filter: blur(6px); border:1px solid #2a2e40;
+    padding:8px 10px; border-radius:12px; font-size:14px
+  }
+  .pill{padding:4px 8px; border-radius:999px; background:#0f1220; border:1px solid #28304a}
+  .accent{color:var(--accent)}
+  .controls{display:flex; flex-wrap:wrap; gap:8px}
+  button{
+    background:#111629; color:var(--text); border:1px solid #2b334d;
+    padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:600
+  }
+  button:hover{border-color:#3e4a77}
+  .small{font-size:12px; color:var(--muted)}
+  .metrics{display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; margin-top:8px}
+  .metric{background:#0f1220; border:1px solid #28304a; border-radius:12px; padding:10px}
+  .metric h4{margin:0 0 6px 0; font-size:12px; color:#b8c1d9; letter-spacing:.3px}
+  .metric .val{font-size:22px; font-weight:800}
+  .bar{height:8px; background:#101425; border:1px solid #28304a; border-radius:999px; overflow:hidden}
+  .bar > span{display:block; height:100%; background:var(--accent); width:0%}
+  canvas#chart{width:100%; height:320px}
+  footer{opacity:.7; text-align:center; padding:10px; font-size:12px}
+</style>
+</head>
+<body>
+  <header>Face Tracker · Blink Counter · Engagement</header>
+  <div class="wrap">
+    <div class="grid">
+      <div class="card">
+        <div class="controls" style="margin-bottom:10px">
+          <button id="startBtn">Start Camera</button>
+          <button id="stopBtn">Stop</button>
+          <button id="calBtn" title="Measure your normal eyes-open EAR baseline">Calibrate (eyes open)</button>
+          <button id="resetBtn" title="Reset stats">Reset</button>
+          <span class="small">Tip: during calibration, look at the camera with eyes comfortably open.</span>
+        </div>
+
+        <div class="videoWrap">
+          <video id="video" playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <div class="hud" id="hud">
+            <div class="pill">Blinks: <span id="blinkCount" class="accent">0</span></div>
+            <div class="pill">EAR: <span id="earVal" class="accent">–</span></div>
+            <div class="pill">Engagement: <span id="engVal" class="accent">0</span></div>
+            <div class="pill">FPS: <span id="fpsVal" class="accent">0</span></div>
+          </div>
+        </div>
+
+        <div class="metrics">
+          <div class="metric">
+            <h4>Blink threshold (EAR)</h4>
+            <div class="val" id="thrVal">–</div>
+            <div class="small">Auto from calibration</div>
+          </div>
+          <div class="metric">
+            <h4>Eyes-open baseline (EAR)</h4>
+            <div class="val" id="baseVal">–</div>
+            <div class="small">Higher ≈ more open eyes</div>
+          </div>
+          <div class="metric">
+            <h4>Engagement bar</h4>
+            <div class="bar"><span id="barFill" style="width:0%"></span></div>
+            <div class="small">Heuristic: eyes open + centered + facing camera</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:6px 0 10px 0; font-size:16px; letter-spacing:.2px">Live Engagement</h3>
+        <canvas id="chart"></canvas>
+      </div>
+    </div>
+    <footer>Runs entirely in your browser. No video leaves your device.</footer>
+  </div>
+
+<script>
+(async function(){
+  // ---------- Elements ----------
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const calBtn = document.getElementById('calBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const blinkEl = document.getElementById('blinkCount');
+  const earEl = document.getElementById('earVal');
+  const thrEl = document.getElementById('thrVal');
+  const baseEl = document.getElementById('baseVal');
+  const engEl = document.getElementById('engVal');
+  const barFill = document.getElementById('barFill');
+  const fpsEl = document.getElementById('fpsVal');
+
+  // ---------- Chart ----------
+  const chartCtx = document.getElementById('chart').getContext('2d');
+  const engChart = new Chart(chartCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'Engagement (0–100)', data: [], fill:false, tension:0.25 }] },
+    options: {
+      animation:false,
+      responsive:true,
+      scales:{ y:{ suggestedMin:0, suggestedMax:100 } },
+      plugins:{ legend:{ display:false } }
+    }
+  });
+
+  // ---------- State ----------
+  let cam = null;
+  let running = false;
+  let lastFrameTime = performance.now(), fps = 0;
+
+  // Blink detection (EAR)
+  let blinkCount = 0;
+  let blinkActive = false;
+  let framesBelow = 0;
+  const MIN_CONSEC_FRAMES = 2;
+
+  // EAR baseline & threshold
+  let baselineEAR = null;    // eyes-open baseline
+  let blinkThreshold = null; // lower than baseline
+  let calibrating = false;
+  let calSamples = [];
+
+  // Engagement
+  let engagement = 0;
+  let lastChartPush = 0;
+
+  // ---------- Utils ----------
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+  function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
+
+  // EAR using selected landmark pairs (MediaPipe FaceMesh indices)
+  // Left eye: 33-133 (horizontal), vertical pairs (159,145) and (158,153)
+  // Right eye: 263-362 (horizontal), vertical pairs (386,374) and (385,380)
+  function computeEAR(lms){
+    const L = {
+      hA: lms[33], hB: lms[133],
+      v1a: lms[159], v1b: lms[145],
+      v2a: lms[158], v2b: lms[153],
+    };
+    const R = {
+      hA: lms[362], hB: lms[263],
+      v1a: lms[386], v1b: lms[374],
+      v2a: lms[385], v2b: lms[380],
+    };
+    const leftEAR  = (dist(L.v1a,L.v1b) + dist(L.v2a,L.v2b)) / (2 * dist(L.hA,L.hB));
+    const rightEAR = (dist(R.v1a,R.v1b) + dist(R.v2a,R.v2b)) / (2 * dist(R.hA,R.hB));
+    return (leftEAR + rightEAR) / 2;
+  }
+
+  // Head orientation heuristic (yaw-ish): eye-corner line angle relative to horizontal
+  function yawScore(lms){
+    const left = lms[33], right = lms[263]; // outer corners
+    const dx = right.x - left.x, dy = right.y - left.y;
+    const ang = Math.atan2(dy, dx) * 180/Math.PI;
+    // 0° is level; penalize tilt beyond ~25°
+    return 1 - clamp(Math.abs(ang)/25, 0, 1);
+  }
+
+  // Centering score: face bbox center vs frame center
+  function centerScore(lms){
+    let minX=1, minY=1, maxX=0, maxY=0;
+    for(const p of lms){ minX = Math.min(minX,p.x); minY = Math.min(minY,p.y); maxX = Math.max(maxX,p.x); maxY = Math.max(maxY,p.y); }
+    const cx = (minX+maxX)/2, cy=(minY+maxY)/2;
+    const dx = cx - 0.5, dy = cy - 0.5;
+    const d = Math.hypot(dx,dy); // ~0..0.7 typical
+    return 1 - clamp(d/0.35, 0, 1);
+  }
+
+  function updateEngagement(ear, lms){
+    if (!lms) { engagement = 0; return 0; }
+    // eyesOpenScore based on location between threshold and baseline
+    const open = (baselineEAR && blinkThreshold)
+      ? clamp((ear - blinkThreshold) / Math.max(1e-6, (baselineEAR - blinkThreshold)), 0, 1)
+      : clamp((ear - 0.15) / 0.15, 0, 1); // fallback
+    const facing = yawScore(lms);
+    const centered = centerScore(lms);
+    const score = 100 * (0.5*open + 0.25*facing + 0.25*centered);
+    engagement = Math.round(clamp(score, 0, 100));
+    engEl.textContent = engagement;
+    barFill.style.width = engagement + '%';
+    return engagement;
+  }
+
+  // ---------- MediaPipe FaceMesh ----------
+  const faceMesh = new FaceMesh.FaceMesh({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+  });
+  faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: true, // irises
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+
+  faceMesh.onResults(onResults);
+
+  async function onResults(results){
+    if (!running) return;
+    // Resize canvas to match video/frame
+    canvas.width = results.image.width;
+    canvas.height = results.image.height;
+
+    // Draw camera image
+    ctx.save();
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+    const lms = results.multiFaceLandmarks && results.multiFaceLandmarks[0];
+
+    if (lms){
+      // Draw landmarks
+      const drawingUtils = window; // drawing_utils exposes globals
+      drawConnectors(ctx, lms, FACEMESH_TESSELATION, {lineWidth:0.5});
+      drawConnectors(ctx, lms, FACEMESH_LEFT_EYE, {lineWidth:1.5});
+      drawConnectors(ctx, lms, FACEMESH_RIGHT_EYE, {lineWidth:1.5});
+      drawConnectors(ctx, lms, FACEMESH_FACE_OVAL, {lineWidth:1});
+
+      const ear = computeEAR(lms);
+      earEl.textContent = ear.toFixed(3);
+
+      // Calibration
+      if (calibrating){
+        calSamples.push(ear);
+        // draw indicator
+        ctx.fillStyle = 'rgba(94,234,212,0.65)';
+        ctx.fillRect(10,10, 120, 26);
+        ctx.fillStyle = '#0b0c10';
+        ctx.font = 'bold 14px system-ui';
+        ctx.fillText('Calibrating…', 18, 28);
+      }
+
+      // Update blink state
+      if (blinkThreshold){
+        if (ear < blinkThreshold){
+          framesBelow++;
+          if (!blinkActive && framesBelow >= MIN_CONSEC_FRAMES){
+            blinkActive = true;
+          }
+        } else {
+          if (blinkActive){
+            blinkCount++;
+            blinkEl.textContent = String(blinkCount);
+          }
+          blinkActive = false;
+          framesBelow = 0;
+        }
+      }
+
+      // Engagement
+      updateEngagement(ear, lms);
+
+    } else {
+      // No face detected
+      updateEngagement(0, null);
+      earEl.textContent = '–';
+    }
+
+    ctx.restore();
+
+    // FPS
+    const now = performance.now();
+    const dt = now - lastFrameTime;
+    fps = 1000 / dt;
+    lastFrameTime = now;
+    fpsEl.textContent = Math.round(fps);
+
+    // Chart update (1 Hz)
+    if (now - lastChartPush > 1000){
+      lastChartPush = now;
+      const ts = new Date().toLocaleTimeString();
+      engChart.data.labels.push(ts);
+      engChart.data.datasets[0].data.push(engagement);
+      if (engChart.data.labels.length > 60){
+        engChart.data.labels.shift();
+        engChart.data.datasets[0].data.shift();
+      }
+      engChart.update('none');
+    }
+  }
+
+  // ---------- Camera control ----------
+  async function start(){
+    if (running) return;
+    // Start MediaPipe camera helper
+    cam = new Camera(video, {
+      onFrame: async () => { await faceMesh.send({image: video}); },
+      width: 640, height: 480
+    });
+    running = true;
+    await cam.start();
+  }
+  async function stop(){
+    running = false;
+    if (cam){ cam.stop(); cam = null; }
+    const s = video.srcObject;
+    if (s){ s.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
+  }
+
+  // ---------- UI handlers ----------
+  startBtn.onclick = start;
+  stopBtn.onclick = stop;
+
+  resetBtn.onclick = () => {
+    blinkCount = 0; blinkEl.textContent = '0';
+    blinkActive = false; framesBelow = 0;
+    baselineEAR = null; blinkThreshold = null; calSamples = []; calibrating = false;
+    thrEl.textContent = '–'; baseEl.textContent = '–';
+    engagement = 0; engEl.textContent = '0'; barFill.style.width = '0%';
+    // clear chart
+    engChart.data.labels = [];
+    engChart.data.datasets[0].data = [];
+    engChart.update();
+  };
+
+  calBtn.onclick = async () => {
+    if (!running){ await start(); }
+    calibrating = true;
+    calSamples = [];
+    // Collect ~2s of samples
+    setTimeout(() => {
+      calibrating = false;
+      if (calSamples.length > 10){
+        // Robust stats
+        calSamples.sort((a,b)=>a-b);
+        // Trim 20% tails
+        const k = Math.floor(calSamples.length*0.2);
+        const trimmed = calSamples.slice(k, calSamples.length-k);
+        const mean = trimmed.reduce((s,x)=>s+x,0) / trimmed.length;
+        baselineEAR = mean;
+        // Threshold = 70% of baseline (tweakable)
+        blinkThreshold = mean * 0.70;
+        thrEl.textContent = blinkThreshold.toFixed(3);
+        baseEl.textContent = baselineEAR.toFixed(3);
+      } else {
+        alert('Calibration failed—face not steady. Try again looking straight at the camera with eyes open.');
+      }
+    }, 2000);
+  };
+
+  // Start automatically if permissions already granted
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    if (devices.some(d=>d.kind==='videoinput')) {
+      // Do not auto-start to respect privacy; leave as manual.
+    }
+  } catch(e){ /* ignore */ }
+
+})();
+</script>
+</body>
+</html>
